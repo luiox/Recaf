@@ -256,7 +256,104 @@ public class BasicInfoImporter implements InfoImporter {
 		//  - utf8  - name of object class
 		//  - class - wrapper of prior
 		int cpSize = ((content[8] & 0xFF) << 8) + (content[9] & 0xFF);
-		return cpSize >= 4;
+		if (cpSize < 4)
+			return false;
+
+		// JVM constant-pool tags are strictly in {@code 1..20}. Obfuscators sometimes corrupt the constant pool
+		// (e.g. the CP tag of an early entry points to a value outside this range) in order to break static
+		// analysis tools. Such "classes" cannot survive CafeDude reading, so we must NOT classify them as classes
+		// in the first place - otherwise an entire entry (or in the worst case an entire stub-prefixed JAR whose
+		// leading bytes look like a CAFEBABE class header) is treated as a single broken class instead of a ZIP
+		// container, and nothing inside can ever be loaded.
+		//
+		// We only need to guard the *first* few CP entries: any class that is broken this quickly is not a real
+		// class regardless. This keeps the pre-check cheap for genuine (potentially large) constant pools.
+		if (!hasLegalConstantPoolHeader(content, cpSize))
+			return false;
+
+		return true;
+	}
+
+	/**
+	 * Checks that the first few constant-pool entries use only legal JVM tags ({@code 1..20}).
+	 *
+	 * @param content
+	 * 		Class file bytes, starting with a {@code CAFEBABE} header.
+	 * @param cpCount
+	 * 		Declared constant-pool count ({@code cp_index}).
+	 *
+	 * @return {@code false} only when an out-of-range tag is encountered in the first few CP entries.
+	 * Content that is simply too short to inspect further is treated leniently so that genuine
+	 * (potentially truncated) class files keep flowing to {@link BasicClassPatcher} for recovery.
+	 */
+	private static boolean hasLegalConstantPoolHeader(byte[] content, int cpCount) {
+		// Constant pool starts right after magic(4) + minor(2) + major(2) + count(2).
+		int pos = 10;
+		int maxEntries = Math.min(cpCount, 16);
+		for (int i = 1; i < maxEntries; i++) {
+			// Too short to read further CP entries -> be lenient, let downstream patching decide.
+			if (pos >= content.length)
+				return true;
+
+			// Tag must be a legal JVM constant-pool tag (1..20). An out-of-range tag here means the content is
+			// definitively not a class (e.g. an obfuscator-corrupted pool, or a stub-prefixed JAR whose leading
+			// bytes merely look like a CAFEBABE class header).
+			int tag = content[pos] & 0xFF;
+			if (!isLegalConstantPoolTag(tag))
+				return false;
+
+			pos++; // consume tag byte
+			// Advance by the size of the entry's payload (already positioned past the tag).
+			switch (tag) {
+				case 1: { // UTF8: u2 length + bytes
+					if (pos + 2 > content.length)
+						return true;
+					int len = ((content[pos] & 0xFF) << 8) | (content[pos + 1] & 0xFF);
+					pos += 2;
+					if (pos + len > content.length)
+						return true;
+					pos += len;
+					break;
+				}
+				case 3, 4: // Integer, Float: u4
+					pos += 4;
+					break;
+				case 5, 6: { // Long, Double: u8 (occupies two CP slots)
+					pos += 8;
+					i++;
+					break;
+				}
+				case 7, 8, 16, 19, 20: // Class, String, MethodType, Module, Package: u2 index
+					pos += 2;
+					break;
+				case 9, 10, 11, 12, 17, 18: // Field/Method/InterfaceMethodref, NameAndType, Dynamic, InvokeDynamic: u4
+					pos += 4;
+					break;
+				case 15: // MethodHandle: u1 ref-kind + u2 index
+					pos += 3;
+					break;
+				default:
+					return false;
+			}
+			if (pos > content.length)
+				return true;
+		}
+		return true;
+	}
+
+	/**
+	 * @param tag
+	 * 		Constant-pool tag byte.
+	 *
+	 * @return Whether the tag is a legal JVM constant-pool tag ({@code 1..20}).
+	 */
+	private static boolean isLegalConstantPoolTag(int tag) {
+		// Valid tags: UTF8=1, Integer=3, Float=4, Long=5, Double=6, Class=7, String=8,
+		// Fieldref=9, Methodref=10, InterfaceMethodref=11, NameAndType=12,
+		// MethodHandle=15, MethodType=16, Dynamic=17, InvokeDynamic=18, Module=19, Package=20.
+		// Tags 2, 13, 14 are reserved/unused and never appear in valid class files.
+		return (tag >= 1 && tag <= 12 && tag != 2) ||
+				(tag >= 15 && tag <= 20);
 	}
 
 	@Nonnull
